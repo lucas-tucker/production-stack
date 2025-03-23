@@ -3,7 +3,7 @@ kind: ConfigMap # defines configs through receivers, processors, exporters, and 
 metadata: # define name for use in other files
   name: otel-collector-conf
   namespace: default
-data: # how we want to collect tracing data is specified here; use oltp
+data: # how we want to collect tracing data is specified here
   collector.yaml: |
     receivers:
       otlp:
