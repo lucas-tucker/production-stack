@@ -1,0 +1,71 @@
+servingEngineSpec:
+  runtimeClassName: ""
+  modelSpec:
+  - name: "llama3"
+    repository: "lmcache/vllm-openai"
+    tag: "latest"
+    # tag: "2025-03-10"
+    modelURL: "meta-llama/Llama-3.1-8B-Instruct"
+    replicaCount: 2
+    requestCPU: 4
+    requestMemory: "8Gi"
+    requestGPU: 1
+    # pvcStorage: "50Gi"
+    # pvcAccessMode:
+    #   - ReadWriteOnce
+    vllmConfig:
+      maxModelLen: 30000
+      v1: 1
+      extraArgs: ["--no-enable-prefix-caching"]
+
+    lmcacheConfig:
+      enabled: true
+      cpuOffloadingBufferSize: "6"
+    env:
+      - name: LMCACHE_LOG_LEVEL
+        value: "DEBUG"
+    hf_token: "my_token"
+
+cacheserverSpec:
+  # -- Number of replicas
+  replicaCount: 1
+
+  # -- Container port
+  containerPort: 8080
+
+  # -- Service port
+  servicePort: 81
+
+  # -- Serializer/Deserializer type
+  serde: "naive"
+
+  # -- Cache server image (reusing the vllm image)
+  repository: "lmcache/vllm-openai"
+  tag: "latest"
+  # tag: "2025-03-10"
+
+  # TODO (Jiayi): please adjust this once we have evictor
+  # -- router resource requests and limits
+  resources:
+    requests:
+      cpu: "4"
+      memory: "4G"
+    limits:
+      cpu: "4"
+      memory: "8G"
+
+  # -- Customized labels for the cache server deployment
+  labels:
+    environment: "cacheserver"
+    release: "cacheserver"
+
+routerSpec:
+  resources:
+    requests:
+      cpu: "8"
+      memory: "8G"
+    limits:
+      cpu: "8"
+      memory: "8G"
+  routingLogic: "session"
+  sessionKey: "x-user-id"
