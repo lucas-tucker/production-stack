@@ -13,11 +13,12 @@
 # limitations under the License.
 
 # --- Request Processing & Routing ---
-# TODO: better request id system
 import json
+import os
 import time
 import uuid
 
+import httpx
 from fastapi import BackgroundTasks, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -141,10 +142,10 @@ async def process_request(
         await store_in_semantic_cache(
             endpoint=endpoint, method=request.method, body=body, chunk=cache_chunk
         )
-        if background_tasks and hasattr(request.app.state, "callbacks"):
-            background_tasks.add_task(
-                request.app.state.callbacks.post_request, request, full_response
-            )
+    if background_tasks and hasattr(request.app.state, "callbacks"):
+        background_tasks.add_task(
+            request.app.state.callbacks.post_request, request, full_response
+        )
 
 
 async def route_general_request(
@@ -171,15 +172,22 @@ async def route_general_request(
         )
         return response
     in_router_time = time.time()
-    request_id = str(uuid.uuid4())
+    # Same as vllm, Get request_id from X-Request-Id header if available
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     request_body = await request.body()
     request_json = await request.json()  # TODO (ApostaC): merge two awaits into one
+
+    if request.query_params:
+        request_endpoint = request.query_params.get("id")
+    else:
+        request_endpoint = None
 
     if hasattr(request.app.state, "callbacks") and (
         response_overwrite := request.app.state.callbacks.pre_request(
             request, request_body, request_json
         )
     ):
+        response_overwrite.headers["X-Request-Id"] = request_id
         return response_overwrite
 
     requested_model = request_json.get("model", None)
@@ -187,6 +195,7 @@ async def route_general_request(
         return JSONResponse(
             status_code=400,
             content={"error": "Invalid request: missing 'model' in request body."},
+            headers={"X-Request-Id": request_id},
         )
 
     # Apply request rewriting if enabled
@@ -206,10 +215,6 @@ async def route_general_request(
     # TODO (ApostaC): merge two awaits into one
     service_discovery = get_service_discovery()
     endpoints = service_discovery.get_endpoint_info()
-    engine_stats = request.app.state.engine_stats_scraper.get_engine_stats()
-    request_stats = request.app.state.request_stats_monitor.get_request_stats(
-        time.time()
-    )
 
     aliases = getattr(service_discovery, "aliases", None)
     if aliases and requested_model in aliases.keys():
@@ -217,14 +222,33 @@ async def route_general_request(
         request_body = replace_model_in_request_body(request_json, requested_model)
         update_content_length(request, request_body)
 
-    endpoints = list(filter(lambda x: x.model_name == requested_model, endpoints))
+    if not request_endpoint:
+        endpoints = list(filter(lambda x: requested_model in x.model_names, endpoints))
+        engine_stats = request.app.state.engine_stats_scraper.get_engine_stats()
+        request_stats = request.app.state.request_stats_monitor.get_request_stats(
+            time.time()
+        )
+    else:
+        endpoints = list(
+            filter(
+                lambda x: requested_model in x.model_names and x.Id == request_endpoint,
+                endpoints,
+            )
+        )
+
     if not endpoints:
         return JSONResponse(
             status_code=400, content={"error": f"Model {requested_model} not found."}
         )
 
     logger.debug(f"Routing request {request_id} for model: {requested_model}")
-    if isinstance(request.app.state.router, KvawareRouter) or isinstance(
+    if request_endpoint:
+        server_url = endpoints[0].url
+        logger.debug(
+            f"Routing request {request_id} to engine with Id: {endpoints[0].Id}"
+        )
+
+    elif isinstance(request.app.state.router, KvawareRouter) or isinstance(
         request.app.state.router, PrefixAwareRouter
     ):
         server_url = await request.app.state.router.route_request(
@@ -234,6 +258,7 @@ async def route_general_request(
         server_url = request.app.state.router.route_request(
             endpoints, engine_stats, request_stats, request
         )
+
     curr_time = time.time()
     logger.info(
         f"Routing request {request_id} to {server_url} at {curr_time}, process time = {curr_time - in_router_time:.4f}"
@@ -247,12 +272,54 @@ async def route_general_request(
         background_tasks,
     )
     headers, status_code = await anext(stream_generator)
+    headers_dict = {key: value for key, value in headers.items()}
+    headers_dict["X-Request-Id"] = request_id
     return StreamingResponse(
         stream_generator,
         status_code=status_code,
-        headers={key: value for key, value in headers.items()},
+        headers=headers_dict,
         media_type="text/event-stream",
     )
+
+
+async def send_request_to_prefiller(
+    client: httpx.AsyncClient, endpoint: str, req_data: dict, request_id: str
+):
+    """
+    Send a request to a prefiller service.
+    """
+    req_data = req_data.copy()
+    req_data["max_tokens"] = 1
+    if "max_completion_tokens" in req_data:
+        req_data["max_completion_tokens"] = 1
+
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+    }
+
+    response = await client.post(endpoint, json=req_data, headers=headers)
+    response.raise_for_status()
+    return response
+
+
+async def send_request_to_decode(
+    client: httpx.AsyncClient, endpoint: str, req_data: dict, request_id: str
+):
+    """
+    Asynchronously stream the response from a service using a persistent client.
+    """
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+    }
+
+    async with client.stream(
+        "POST", endpoint, json=req_data, headers=headers
+    ) as response:
+        response.raise_for_status()
+        async for chunk in response.aiter_bytes():
+            yield chunk
 
 
 async def route_disaggregated_prefill_request(
@@ -261,70 +328,29 @@ async def route_disaggregated_prefill_request(
     background_tasks: BackgroundTasks,
 ):
     in_router_time = time.time()
-    request_id = str(uuid.uuid4())
+    # Same as vllm, Get request_id from X-Request-Id header if available
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     request_body = await request.body()
     request_json = await request.json()  # TODO (ApostaC): merge two awaits into one
 
-    if hasattr(request.app.state, "callbacks") and (
-        response_overwrite := request.app.state.callbacks.pre_request(
-            request, request_body, request_json
-        )
-    ):
-        return response_overwrite
-
-    requested_model = request_json.get("model", None)
-    if requested_model is None:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Invalid request: missing 'model' in request body."},
-        )
-
-    # TODO (ApostaC): merge two awaits into one
-    endpoints = get_service_discovery().get_endpoint_info()
-    engine_stats = request.app.state.engine_stats_scraper.get_engine_stats()
-    request_stats = request.app.state.request_stats_monitor.get_request_stats(
-        time.time()
-    )
-
-    endpoints = list(filter(lambda x: x.model_name == requested_model, endpoints))
-    if not endpoints:
-        return JSONResponse(
-            status_code=400, content={"error": f"Model {requested_model} not found."}
-        )
     orig_max_tokens = request_json.get("max_tokens", 0)
     request_json["max_tokens"] = 1
-    server_url = request.app.state.router.route_request(
-        endpoints, engine_stats, request_stats, request, request_json
+    st = time.time()
+    prefiller_response = await send_request_to_prefiller(
+        request.app.state.prefill_client, endpoint, request_json, request_id
     )
-    print(f"Server URL: {server_url}")
-    prefiller_response = process_request(
-        request,
-        request_body,
-        server_url,
-        request_id,
-        endpoint,
-        background_tasks,
-    )
-    headers, status_code = await anext(prefiller_response)
-    async for _ in prefiller_response:
-        pass
+    et = time.time()
+    logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
     request_json["max_tokens"] = orig_max_tokens
-    server_url = request.app.state.router.route_request(
-        endpoints, engine_stats, request_stats, request, request_json
-    )
-    print(f"Server URL: {server_url}")
-    decoder_response = process_request(
-        request,
-        request_body,
-        server_url,
-        request_id,
-        endpoint,
-        background_tasks,
-    )
-    headers, status_code = await anext(decoder_response)
+
+    async def generate_stream():
+        async for chunk in send_request_to_decode(
+            request.app.state.decode_client, endpoint, request_json, request_id
+        ):
+            yield chunk
+
     return StreamingResponse(
-        decoder_response,
-        status_code=status_code,
-        headers={key: value for key, value in headers.items()},
-        media_type="text/event-stream",
+        generate_stream(),
+        media_type="application/json",
+        headers={"X-Request-Id": request_id},
     )
